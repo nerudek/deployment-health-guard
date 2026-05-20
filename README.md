@@ -1,0 +1,1 @@
+# Post-Deploy — Monitor, Alert, Recover\n\nPost-deployment monitoring, alerting, rollback, and health checks — know the moment your app breaks and fix it before users notice\n\nSee [SKILL.md](./SKILL.md) for the full guide.\n\n---\nIf this saved you time: [PayPal.me/nerudek](https://www.paypal.me/nerudek)\nGitHub: [github.com/nerudek](https://github.com/nerudek)
