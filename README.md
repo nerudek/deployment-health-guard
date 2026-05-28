@@ -1,6 +1,6 @@
-# Post-Deploy — Monitor, Alert, Recover
+# Deployment Health Guard
 
-Post-deployment monitoring, alerting, rollback, and health checks — detect failures instantly and recover before users notice.
+Post-deployment monitoring, alerting, rollback automation, and health checks — detect failures instantly and recover before users notice.
 
 ---
 
@@ -26,6 +26,8 @@ Post-deployment monitoring, alerting, rollback, and health checks — detect fai
 
 You deployed your app. Three hours later, a user messages you: "site is down." You had no idea. There is no monitoring, no alerts, no automatic recovery. Every outage is discovered by users, not by your infrastructure. Rolling back requires SSH, git reflog, and praying.
 
+Manual processes fail under pressure — alert fatigue, forgotten cron jobs, and configuration drift all contribute to missed incidents. Small teams lack dedicated SRE tooling but still need production-grade reliability.
+
 ## 2. Solution Overview
 
 A layered monitoring and recovery system:
@@ -36,6 +38,8 @@ A layered monitoring and recovery system:
 - **Uptime dashboard** showing real-time status
 - **Resource monitoring** for CPU, RAM, and disk thresholds
 - **Log aggregation** for post-mortem analysis
+
+The system is designed for a single VPS, container, or PaaS deployment — no Kubernetes required, no SaaS dependency beyond the alerting channels you already use.
 
 ## 3. Architecture
 
@@ -114,8 +118,8 @@ flowchart TD
 
 ```bash
 # 1. Clone this repo
-git clone https://github.com/nerudek/post-deploy.git
-cd post-deploy
+git clone https://github.com/nerudek/deployment-health-guard.git
+cd deployment-health-guard
 
 # 2. Create a health endpoint in your app (see section 5)
 
@@ -138,6 +142,8 @@ import urllib.request, json, time, os, subprocess
 TARGET = os.getenv("HEALTH_URL", "https://your-app.com/health")
 TELEGRAM_BOT = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT = os.getenv("TELEGRAM_CHAT_ID")
+DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK_URL")
+SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL")
 MAX_FAILURES = 3
 CHECK_INTERVAL = 60
 
@@ -145,6 +151,14 @@ def alert(msg):
     if TELEGRAM_BOT and TELEGRAM_CHAT:
         urllib.request.urlopen(f"https://api.telegram.org/bot{TELEGRAM_BOT}/sendMessage",
             data=urllib.parse.urlencode({"chat_id": TELEGRAM_CHAT, "text": msg}).encode())
+    if DISCORD_WEBHOOK:
+        urllib.request.urlopen(DISCORD_WEBHOOK,
+            data=json.dumps({"content": msg}).encode(),
+            headers={"Content-Type": "application/json"})
+    if SLACK_WEBHOOK:
+        urllib.request.urlopen(SLACK_WEBHOOK,
+            data=json.dumps({"text": msg}).encode(),
+            headers={"Content-Type": "application/json"})
     print(f"[ALERT] {msg}")
 
 failures = 0
@@ -227,6 +241,22 @@ curl -X POST "$SLACK_WEBHOOK" \
   -d '{"text": "ALERT: App is DOWN at '"$(date)"'"}'
 ```
 
+### PagerDuty (via Events API v2)
+
+```bash
+curl -X POST "https://events.pagerduty.com/v2/enqueue" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "routing_key": "'"$PD_ROUTING_KEY"'",
+    "event_action": "trigger",
+    "payload": {
+      "summary": "App is DOWN at '"$(date)"'",
+      "source": "health-guard",
+      "severity": "critical"
+    }
+  }'
+```
+
 ## 7. Automatic Rollback
 
 | Platform | Command |
@@ -237,6 +267,8 @@ curl -X POST "$SLACK_WEBHOOK" \
 | Vercel | Dashboard: Promote previous deploy to Production |
 | K8s | `kubectl rollout undo deployment/app` |
 | Heroku | `heroku rollback` |
+| Docker Compose | `docker compose down && docker compose up -d --build` (previous image tag) |
+| AWS ECS | `aws ecs update-service --cluster prod --service app --task-definition app:prev` |
 
 ### Rollback safety checks
 
@@ -245,6 +277,17 @@ curl -X POST "$SLACK_WEBHOOK" \
 3. After rollback, run **one final health check**
 4. If rollback also fails, **stop and escalate to humans**
 5. Log every rollback event with timestamps for post-mortem
+
+### Grace Period
+
+After a deploy, silence alerting for 90 seconds to avoid false positives during startup:
+
+```bash
+# In your deploy script
+export DEPLOY_GRACE=90
+# ... deploy commands ...
+# Health checker reads DEPLOY_GRACE and skips alerts for that many seconds
+```
 
 ## 8. Uptime Dashboard
 
@@ -320,6 +363,16 @@ if [ "$CPU_PERCENT" -gt "$THRESHOLD" ]; then
 fi
 ```
 
+### Prometheus + Node Exporter (alternative)
+
+```bash
+# Install node_exporter on your server
+./node_exporter --web.listen-address=":9100" &
+
+# Query from your monitoring machine
+curl -s http://your-server:9100/metrics | grep -E "node_memory_MemAvailable|node_filesystem_avail|node_load1"
+```
+
 ## 10. Log Aggregation
 
 ```bash
@@ -331,6 +384,28 @@ grep -rn "ERROR\|FATAL\|CRASH" logs/
 
 # Rotate daily
 0 0 * * * mv logs/app-$(date -d yesterday +%Y%m%d).log logs/archive/
+```
+
+### Structured log format (JSON)
+
+```python
+import json, logging
+
+logger = logging.getLogger("health-guard")
+handler = logging.StreamHandler()
+
+class JSONFormatter(logging.Formatter):
+    def format(self, record):
+        return json.dumps({
+            "time": self.formatTime(record),
+            "level": record.levelname,
+            "message": record.getMessage(),
+            "module": record.module,
+        })
+
+handler.setFormatter(JSONFormatter())
+logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 ```
 
 ### Dead Man's Switch
@@ -354,6 +429,9 @@ If the monitoring script crashes, Healthchecks.io alerts you — preventing a si
 5. **Health check URL exposed** — use a cacheable path behind CDN or protect with a simple token.
 6. **No deploy grace period** — health checks resume immediately after deploy, causing false positives. Add a 60-second grace window.
 7. **Only monitoring HTTP** — check SSL expiry, cron jobs, background workers, and queue depth too.
+8. **Not testing alerts** — configure alerts and then test them by intentionally breaking the health endpoint to verify the full alert pipeline works.
+9. **Ignoring latency** — a responding endpoint that takes 30 seconds is just as bad as a down one. Track response times and alert on degradation.
+10. **No post-mortem logging** — without timestamped rollback and alert logs, every incident starts from zero. Always log.
 
 ## 12. FAQ
 
@@ -408,9 +486,29 @@ Monitor queue depth, worker process count, and job failure rate. Add dedicated h
 **Q: How to handle database connection pool exhaustion?**
 Track active connections in the health endpoint. Alert when pool usage exceeds 80%.
 
+**Q: What happens if rollback also fails?**
+The system halts and escalates to humans. Repeated rollback failures indicate a deeper infrastructure problem that automation cannot solve.
+
+**Q: Can I run this without Python?**
+Yes — the health check logic is simple enough to port to bash, Go, or Node.js. The Python version is the reference implementation.
+
 ## 13. Contributing & Support
 
-Contributions are welcome! Open an issue or pull request on [GitHub](https://github.com/nerudek/post-deploy).
+Contributions are welcome! Open an issue or pull request on [GitHub](https://github.com/nerudek/deployment-health-guard).
+
+### How to contribute
+
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feature/my-change`
+3. Commit your changes: `git commit -am 'Add new feature'`
+4. Push: `git push origin feature/my-change`
+5. Submit a pull request
+
+### Support
+
+- **Issues**: GitHub issue tracker
+- **Feature requests**: Open an issue with the "enhancement" tag
+- **Security concerns**: Open a private vulnerability report
 
 ---
 
